@@ -30,11 +30,13 @@ The tool is intended for developers who need to reliably reproduce a sudden conn
 
 - **Per-application targeting**: select one or more running processes (listed the same way Task Manager would show them) or browse for an executable manually.
 - **Search filtering**: filter the process list by name; selections are preserved even while filtered out of view.
-- **Three trigger modes**:
+- **Four trigger modes**:
   - **Hold** — connection is cut while the hotkey is held down and restored on release.
   - **Toggle** — each press flips the state between cut and restored.
   - **Timed** — a single press cuts the connection for a configurable duration (in seconds) and restores it automatically.
+  - **Cycle** — a single press starts a repeating cut/restore loop with independent On and Off durations, in milliseconds; the loop keeps running on its own until the hotkey is pressed again to stop it.
 - **Custom hotkeys**: bind any keyboard key or mouse button as the trigger.
+- **Persistent settings**: the selected hotkey and all durations (Timed seconds, Cycle On/Off milliseconds) are saved automatically and restored the next time the app is launched.
 - **Global, low-latency response**: hotkeys are captured system-wide and work even when a target application is running in fullscreen.
 - **On-screen overlay**: a small, draggable, always-on-top badge shows the current state (CUT / CONNECTED) along with a live stopwatch that starts when a cut begins and stops when connectivity is restored.
 - **Instant rule application**: firewall rules are applied and removed directly through the Windows Firewall COM API rather than by shelling out to `netsh`, avoiding the latency of spawning external processes.

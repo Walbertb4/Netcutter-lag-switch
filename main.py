@@ -7,12 +7,20 @@ key OR mouse button). Built for testing an anti-lag-switch mechanic in
 your own game while things like voice chat with your team keep
 working normally.
 
-3 modes:
+4 modes:
   - Hold   : the target app(s)' connection stays cut while the
              key/button is held down, restored on release
   - Toggle : each press flips the state (cut / restore)
   - Timed  : a press cuts the target app(s) for X seconds, then they
              are restored automatically
+  - Cycle  : a press starts a repeating cut/restore loop with separate
+             On/Off durations in milliseconds (e.g. cut for 3000ms,
+             restored for 2000ms, repeating) - it keeps looping on its
+             own until the hotkey is pressed again to stop it
+
+The hotkey and all durations (Timed seconds, Cycle On/Off ms) are
+saved automatically and reloaded the next time the app is launched,
+so they don't need to be reconfigured every session.
 
 Must be run as Administrator (required for Windows Firewall rules
 and the global keyboard/mouse hook).
@@ -35,6 +43,7 @@ Reliability notes:
 """
 
 import ctypes
+import json
 import os
 import threading
 import time
@@ -67,6 +76,12 @@ MIN_PRESS_INTERVAL = 0.15
 # How often the overlay's elapsed-time counter refreshes while a cut
 # is active.
 TIMER_TICK_MS = 100
+
+# Where saved settings (hotkey + durations) live between sessions.
+CONFIG_DIR = os.path.join(
+    os.getenv("APPDATA") or os.path.expanduser("~"), "NetCutter"
+)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 MOUSE_NAMES = {
     "left": "LEFT CLICK",
@@ -211,11 +226,19 @@ class App(ctk.CTk):
         self.mode = ctk.StringVar(value="toggle")
         self.hotkey = {"type": "keyboard", "value": "f8"}
         self.duration_var = ctk.StringVar(value="5.0")
+        self.cycle_on_var = ctk.StringVar(value="3000")
+        self.cycle_off_var = ctk.StringVar(value="2000")
         self.search_var = ctk.StringVar()
         self.is_cut = False
         self.capturing = False
         self._key_held = False  # guards against OS key-repeat
         self._last_press_time = 0.0  # guards against duplicate down events
+
+        # Cycle mode state: a background thread that keeps cutting and
+        # restoring on a loop until stopped.
+        self._cycle_running = False
+        self._cycle_thread = None
+        self._cycle_stop_event = threading.Event()
 
         # path -> display name, for every app currently known (running
         # or manually browsed-to).
@@ -224,11 +247,55 @@ class App(ctk.CTk):
         self.selected_paths = set()
         # path -> (checkbox widget, BooleanVar)
         self._app_checkboxes = {}
+        # Entry widgets that should keep their focus highlight only
+        # while actually clicked into - see _maybe_clear_focus.
+        self._focusable_entries = []
 
+        self._load_config()
         self._build_ui()
         self.overlay = Overlay(self)
         self._register_hotkey()
         self._refresh_app_list()
+
+    # ---------------- Saved settings ----------------
+    def _load_config(self):
+        """Loads a previously saved hotkey/mode/durations, if any,
+        so the user doesn't have to reconfigure them every launch."""
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        hk = data.get("hotkey")
+        if isinstance(hk, dict) and hk.get("type") in ("keyboard", "mouse") and hk.get("value"):
+            self.hotkey = {"type": hk["type"], "value": hk["value"]}
+
+        mode = data.get("mode")
+        if mode in ("hold", "toggle", "timed", "cycle"):
+            self.mode.set(mode)
+
+        if "duration_s" in data:
+            self.duration_var.set(str(data["duration_s"]))
+        if "cycle_on_ms" in data:
+            self.cycle_on_var.set(str(data["cycle_on_ms"]))
+        if "cycle_off_ms" in data:
+            self.cycle_off_var.set(str(data["cycle_off_ms"]))
+
+    def _save_config(self):
+        data = {
+            "hotkey": self.hotkey,
+            "mode": self.mode.get(),
+            "duration_s": self.duration_var.get(),
+            "cycle_on_ms": self.cycle_on_var.get(),
+            "cycle_off_ms": self.cycle_off_var.get(),
+        }
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -240,6 +307,11 @@ class App(ctk.CTk):
         content = ctk.CTkScrollableFrame(self, fg_color=BG, corner_radius=0)
         content.pack(fill="both", expand=True)
         self._content = content
+
+        # Clicking anywhere outside a text entry removes keyboard focus
+        # from it, so the entry's blue focus highlight doesn't stay
+        # visually "stuck" open after the user has clicked elsewhere.
+        self.bind_all("<Button-1>", self._maybe_clear_focus, add="+")
 
         ctk.CTkLabel(
             content, text="NetCutter", font=ctk.CTkFont(size=20, weight="bold")
@@ -273,6 +345,7 @@ class App(ctk.CTk):
         )
         self.search_entry.pack(padx=12, pady=(0, 8), fill="x")
         self.search_var.trace_add("write", lambda *_args: self._render_app_list())
+        self._focusable_entries.append(self.search_entry)
 
         self.app_scroll = ctk.CTkScrollableFrame(
             app_frame, height=170, fg_color="#111111", corner_radius=8
@@ -309,13 +382,14 @@ class App(ctk.CTk):
             ("hold", "Hold - cut while held down, restored on release"),
             ("toggle", "Toggle - each press flips the state"),
             ("timed", "Timed - a press cuts for X seconds, then restores"),
+            ("cycle", "Cycle - a press starts an On/Off loop, press again to stop"),
         ]:
             ctk.CTkRadioButton(
                 mode_frame,
                 text=text,
                 variable=self.mode,
                 value=value,
-                command=self._register_hotkey,
+                command=self._on_mode_change,
             ).pack(anchor="w", padx=12, pady=6)
         ctk.CTkFrame(mode_frame, height=8, fg_color=PANEL).pack()
 
@@ -329,6 +403,51 @@ class App(ctk.CTk):
         self.duration_entry.pack(padx=12, pady=(0, 12), fill="x")
         self.duration_entry.bind("<Return>", lambda e: self.focus_set())
         self.duration_entry.bind("<Escape>", lambda e: self.focus_set())
+        self.duration_entry.bind("<FocusOut>", lambda e: self._save_config())
+        self._focusable_entries.append(self.duration_entry)
+
+        # Cycle settings
+        cycle_frame = ctk.CTkFrame(content, fg_color=PANEL, corner_radius=10)
+        cycle_frame.pack(padx=20, pady=8, fill="x")
+        ctk.CTkLabel(
+            cycle_frame,
+            text="Cycle Durations (milliseconds) - Cycle mode only",
+            font=ctk.CTkFont(weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 4))
+        ctk.CTkLabel(
+            cycle_frame,
+            text="Example: On = 3000, Off = 2000 -> cut for 3s, restored for 2s, repeating.",
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        cycle_row = ctk.CTkFrame(cycle_frame, fg_color=PANEL)
+        cycle_row.pack(padx=12, pady=(0, 12), fill="x")
+
+        on_col = ctk.CTkFrame(cycle_row, fg_color=PANEL)
+        on_col.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        ctk.CTkLabel(on_col, text="On (ms)", font=ctk.CTkFont(size=11)).pack(
+            anchor="w"
+        )
+        self.cycle_on_entry = ctk.CTkEntry(on_col, textvariable=self.cycle_on_var)
+        self.cycle_on_entry.pack(fill="x", pady=(2, 0))
+        self.cycle_on_entry.bind("<Return>", lambda e: self.focus_set())
+        self.cycle_on_entry.bind("<Escape>", lambda e: self.focus_set())
+        self.cycle_on_entry.bind("<FocusOut>", lambda e: self._save_config())
+        self._focusable_entries.append(self.cycle_on_entry)
+
+        off_col = ctk.CTkFrame(cycle_row, fg_color=PANEL)
+        off_col.pack(side="left", expand=True, fill="x", padx=(6, 0))
+        ctk.CTkLabel(off_col, text="Off (ms)", font=ctk.CTkFont(size=11)).pack(
+            anchor="w"
+        )
+        self.cycle_off_entry = ctk.CTkEntry(off_col, textvariable=self.cycle_off_var)
+        self.cycle_off_entry.pack(fill="x", pady=(2, 0))
+        self.cycle_off_entry.bind("<Return>", lambda e: self.focus_set())
+        self.cycle_off_entry.bind("<Escape>", lambda e: self.focus_set())
+        self.cycle_off_entry.bind("<FocusOut>", lambda e: self._save_config())
+        self._focusable_entries.append(self.cycle_off_entry)
 
         # Hotkey
         hk_frame = ctk.CTkFrame(content, fg_color=PANEL, corner_radius=10)
@@ -337,7 +456,9 @@ class App(ctk.CTk):
             anchor="w", padx=12, pady=(12, 4)
         )
         self.hotkey_label = ctk.CTkLabel(
-            hk_frame, text="F8", font=ctk.CTkFont(size=18, weight="bold")
+            hk_frame,
+            text=self._hotkey_display_text(),
+            font=ctk.CTkFont(size=18, weight="bold"),
         )
         self.hotkey_label.pack(pady=4)
         self.hotkey_btn = ctk.CTkButton(
@@ -447,11 +568,40 @@ class App(ctk.CTk):
             )
 
     def _update_hotkey_label(self):
+        self.hotkey_label.configure(text=self._hotkey_display_text())
+
+    def _hotkey_display_text(self):
         if self.hotkey["type"] == "keyboard":
-            text = self.hotkey["value"].upper()
-        else:
-            text = MOUSE_NAMES.get(self.hotkey["value"], self.hotkey["value"].upper())
-        self.hotkey_label.configure(text=text)
+            return self.hotkey["value"].upper()
+        return MOUSE_NAMES.get(self.hotkey["value"], self.hotkey["value"].upper())
+
+    def _maybe_clear_focus(self, event):
+        """Drops keyboard focus from a text entry once the user clicks
+        anywhere outside of it, so its focus highlight doesn't stay on
+        indefinitely."""
+        try:
+            widget_path = str(event.widget)
+        except Exception:
+            return
+        for entry in self._focusable_entries:
+            try:
+                if widget_path.startswith(str(entry)):
+                    return  # click landed inside one of our entries
+            except Exception:
+                continue
+        try:
+            self.focus_set()
+        except Exception:
+            pass
+
+    def _on_mode_change(self):
+        # Switching away from Cycle mode should stop any loop that is
+        # currently running, instead of leaving it cutting the target
+        # app(s) in the background indefinitely.
+        if self.mode.get() != "cycle" and self._cycle_running:
+            self._stop_cycle()
+        self._register_hotkey()
+        self._save_config()
 
     # ---------------- Hotkey capture (keyboard + mouse) ----------------
     def _capture_hotkey(self):
@@ -478,6 +628,7 @@ class App(ctk.CTk):
             self.after(0, self._update_hotkey_label)
             self.after(0, lambda: self.hotkey_btn.configure(text="Change Hotkey"))
             self._register_hotkey()
+            self._save_config()
 
         def on_key(event):
             if not self.capturing:
@@ -535,6 +686,8 @@ class App(ctk.CTk):
             self._toggle()
         elif mode == "timed":
             self._timed_cut()
+        elif mode == "cycle":
+            self._toggle_cycle()
 
     def _on_release(self, *_args):
         self._key_held = False
@@ -585,6 +738,58 @@ class App(ctk.CTk):
         time.sleep(dur)
         self._restore()
 
+    # ---------------- Cycle mode (repeating On/Off loop) ----------------
+    def _toggle_cycle(self):
+        if self._cycle_running:
+            self._stop_cycle()
+        else:
+            self._start_cycle()
+
+    def _start_cycle(self):
+        if self._cycle_running:
+            return
+        if not self.selected_paths:
+            self.after(0, self._warn_no_app)
+            return
+
+        try:
+            on_ms = max(1, int(float(self.cycle_on_var.get().replace(",", "."))))
+        except ValueError:
+            on_ms = 3000
+        try:
+            off_ms = max(1, int(float(self.cycle_off_var.get().replace(",", "."))))
+        except ValueError:
+            off_ms = 2000
+
+        self._cycle_stop_event.clear()
+        self._cycle_running = True
+        self._cycle_thread = threading.Thread(
+            target=self._cycle_loop, args=(on_ms / 1000.0, off_ms / 1000.0), daemon=True
+        )
+        self._cycle_thread.start()
+
+    def _stop_cycle(self):
+        if not self._cycle_running:
+            return
+        self._cycle_running = False
+        self._cycle_stop_event.set()
+
+    def _cycle_loop(self, on_s, off_s):
+        # Runs on a background thread: alternately cuts for on_s
+        # seconds and restores for off_s seconds until _stop_cycle()
+        # sets the stop event. Event.wait() is used instead of
+        # time.sleep() so a stop request is picked up immediately
+        # rather than after the current phase finishes.
+        while not self._cycle_stop_event.is_set():
+            self._cut()
+            if self._cycle_stop_event.wait(on_s):
+                break
+            self._restore()
+            if self._cycle_stop_event.wait(off_s):
+                break
+        self._restore()
+        self._cycle_running = False
+
     def _set_status(self, connected: bool):
         if connected:
             self.status_label.configure(text="Status: CONNECTED", text_color=GREEN)
@@ -593,6 +798,8 @@ class App(ctk.CTk):
         self.overlay.set_status(connected)
 
     def on_close(self):
+        self._stop_cycle()
+        self._save_config()
         net.force_clean()
         try:
             keyboard.unhook_all()
