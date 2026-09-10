@@ -1,0 +1,6 @@
+customtkinter
+keyboard
+mouse
+psutil
+pywin32
+pyinstaller
