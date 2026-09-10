@@ -8,6 +8,24 @@ NetCutter blocks inbound and outbound traffic for specific target applications r
 
 The tool is intended for developers who need to reliably reproduce a sudden connection drop against their own application, for example to verify how a game client and server behave when a player's connection is cut mid-session, or to validate an anti-lag-switch detection system.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center"><img src="images/screenshot-main.png" width="360" alt="Target application selection"></td>
+    <td align="center"><img src="images/screenshot-hotkey.png" width="360" alt="Mode, duration, and hotkey configuration"></td>
+  </tr>
+  <tr>
+    <td align="center">Target application selection</td>
+    <td align="center">Mode, duration, and hotkey configuration</td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="images/screenshot-overlay.png" alt="On-screen overlay showing cut state and elapsed time"><br>
+  On-screen overlay showing the current state and elapsed cut duration
+</p>
+
 ## Features
 
 - **Per-application targeting**: select one or more running processes (listed the same way Task Manager would show them) or browse for an executable manually.
