@@ -45,6 +45,7 @@ Reliability notes:
 import ctypes
 import json
 import os
+import queue
 import threading
 import time
 from tkinter import filedialog, messagebox
@@ -84,12 +85,133 @@ CONFIG_DIR = os.path.join(
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 MOUSE_NAMES = {
-    "left": "LEFT CLICK",
     "right": "RIGHT CLICK",
     "middle": "MIDDLE CLICK",
     "x": "MOUSE 4",
     "x2": "MOUSE 5",
 }
+
+MOUSE_VKS = {
+    "right": 0x02,
+    "middle": 0x04,
+    "x": 0x05,
+    "x2": 0x06,
+}
+VK_TO_MOUSE = {vk: btn for btn, vk in MOUSE_VKS.items()}
+
+_MODIFIER_VKS = {
+    "shift": (0x10, 0xA0, 0xA1),
+    "left shift": (0xA0,),
+    "right shift": (0xA1,),
+    "ctrl": (0x11, 0xA2, 0xA3),
+    "left ctrl": (0xA2,),
+    "right ctrl": (0xA3,),
+    "alt": (0x12, 0xA4, 0xA5),
+    "left alt": (0xA4,),
+    "right alt": (0xA5,),
+    "alt gr": (0xA5,),
+}
+
+# Candidate keyboard VKs for GetAsyncKeyState fallback capture (excludes
+# mouse buttons 0x01-0x06, generic shift/ctrl/alt 0x10-0x12 in favor of
+# sided 0xA0-0xA5, and packet/reserved codes).
+_CAPTURE_KB_VKS = tuple(
+    vk
+    for vk in range(0x08, 0xFF)
+    if vk not in (0x0A, 0x0B, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x5E, 0xE7)
+    and not (0x3A <= vk <= 0x40)
+    and not (0x88 <= vk <= 0x8F)
+    and not (0x92 <= vk <= 0x9F)
+    and not (0xB8 <= vk <= 0xB9)
+    and not (0xC1 <= vk <= 0xDA)
+)
+
+
+def _official_vk_maps():
+    vk_to_name = {0x20: "space", 0x0D: "enter", 0x1B: "esc"}
+    name_to_vk = {"space": 0x20, "enter": 0x0D, "esc": 0x1B, "escape": 0x1B}
+    try:
+        from keyboard import _winkeyboard
+
+        for vk, info in _winkeyboard.official_virtual_keys.items():
+            nm = info[0] if isinstance(info, tuple) else info
+            if isinstance(nm, str):
+                low = nm.lower()
+                vk_to_name.setdefault(vk, low)
+                name_to_vk.setdefault(low, vk)
+    except Exception:
+        pass
+    name_to_vk.setdefault("left alt", 0xA4)
+    name_to_vk.setdefault("right alt", 0xA5)
+    vk_to_name[0xA4] = "left alt"
+    vk_to_name[0xA5] = "right alt"
+    return vk_to_name, name_to_vk
+
+
+_VK_TO_NAME, _NAME_TO_VK = _official_vk_maps()
+
+
+def _vk_to_key_name(vk: int) -> str:
+    if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+        if vk == 0x49 and (ctypes.windll.user32.VkKeyScanW(ord("ı")) & 0xFF) == 0x49:
+            return "ı"
+        return chr(vk).lower()
+    ch = ctypes.windll.user32.MapVirtualKeyW(vk, 2) & 0xFFFF
+    if ch == 0x0130:  # Turkish dotted capital İ -> 'i'
+        return "i"
+    if ch > 32 and not (ch & 0x8000):
+        return chr(ch).lower()
+    return _VK_TO_NAME.get(vk, f"vk_{vk}")
+
+
+def _resolve_keyboard_hotkey(hk: dict):
+    """Returns (normalized_name, tuple_of_vks, frozenset_of_scan_codes)."""
+    user32 = ctypes.windll.user32
+    raw = str(hk.get("value") or "")
+    norm = raw.strip().lower()
+    if raw == "İ":
+        norm = "i"
+
+    vks = []
+    saved_vk = hk.get("vk")
+    if isinstance(saved_vk, int) and 0 < saved_vk < 256:
+        vks.append(saved_vk)
+
+    if norm in _MODIFIER_VKS:
+        for v in _MODIFIER_VKS[norm]:
+            if v not in vks:
+                vks.append(v)
+    elif norm.startswith("vk_") and norm[3:].isdigit():
+        v = int(norm[3:])
+        if v not in vks:
+            vks.append(v)
+    else:
+        if len(raw) == 1:
+            for ch in (raw, norm, raw.upper()):
+                if len(ch) == 1:
+                    res = user32.VkKeyScanW(ord(ch))
+                    if res != -1 and (res & 0xFF) and (res & 0xFF) not in vks:
+                        vks.append(res & 0xFF)
+            if not vks and ("a" <= norm <= "z" or "0" <= norm <= "9"):
+                vks.append(ord(norm.upper()))
+        if norm in _NAME_TO_VK and _NAME_TO_VK[norm] not in vks:
+            vks.append(_NAME_TO_VK[norm])
+
+    scans = set()
+    saved_sc = hk.get("scan_code")
+    if isinstance(saved_sc, int) and saved_sc > 0:
+        scans.add(saved_sc)
+    for vk in vks:
+        sc = user32.MapVirtualKeyW(vk, 0)
+        if sc > 0:
+            scans.add(sc)
+    if not scans and norm:
+        try:
+            scans.update(c for c in keyboard.key_to_scan_codes(norm, error_if_missing=False) if c > 0)
+        except Exception:
+            pass
+
+    return norm, tuple(vks), frozenset(scans)
 
 
 class Overlay(ctk.CTkToplevel):
@@ -233,6 +355,13 @@ class App(ctk.CTk):
         self.capturing = False
         self._key_held = False  # guards against OS key-repeat
         self._last_press_time = 0.0  # guards against duplicate down events
+        self._press_lock = threading.Lock()
+        self._ignore_until_release = False
+        self._stop_poller = False
+        self._hk_name = ""
+        self._hk_vks = ()
+        self._hk_scan_codes = frozenset()
+        self._ui_queue = queue.SimpleQueue()
 
         # Cycle mode state: a background thread that keeps cutting and
         # restoring on a loop until stopped.
@@ -252,10 +381,38 @@ class App(ctk.CTk):
         self._focusable_entries = []
 
         self._load_config()
+        self._sync_vars()
+        self.mode.trace_add("write", lambda *_a: self._sync_vars())
+        self.duration_var.trace_add("write", lambda *_a: self._sync_vars())
+        self.cycle_on_var.trace_add("write", lambda *_a: self._sync_vars())
+        self.cycle_off_var.trace_add("write", lambda *_a: self._sync_vars())
+
         self._build_ui()
         self.overlay = Overlay(self)
         self._register_hotkey()
+        threading.Thread(target=self._poll_hotkey_loop, daemon=True).start()
+        self.after(30, self._drain_ui_queue)
         self._refresh_app_list()
+
+    def _sync_vars(self):
+        self._mode_val = self.mode.get()
+        self._duration_str = self.duration_var.get()
+        self._cycle_on_str = self.cycle_on_var.get()
+        self._cycle_off_str = self.cycle_off_var.get()
+
+    def _drain_ui_queue(self):
+        if self._stop_poller:
+            return
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                pass
+        self.after(30, self._drain_ui_queue)
 
     # ---------------- Saved settings ----------------
     def _load_config(self):
@@ -268,8 +425,15 @@ class App(ctk.CTk):
             return
 
         hk = data.get("hotkey")
-        if isinstance(hk, dict) and hk.get("type") in ("keyboard", "mouse") and hk.get("value"):
-            self.hotkey = {"type": hk["type"], "value": hk["value"]}
+        if (
+            isinstance(hk, dict)
+            and hk.get("type") in ("keyboard", "mouse")
+            and hk.get("value")
+            and not (hk.get("type") == "mouse" and hk.get("value") == "left")
+        ):
+            self.hotkey = {
+                k: hk[k] for k in ("type", "value", "vk", "scan_code") if k in hk
+            }
 
         mode = data.get("mode")
         if mode in ("hold", "toggle", "timed", "cycle"):
@@ -285,10 +449,10 @@ class App(ctk.CTk):
     def _save_config(self):
         data = {
             "hotkey": self.hotkey,
-            "mode": self.mode.get(),
-            "duration_s": self.duration_var.get(),
-            "cycle_on_ms": self.cycle_on_var.get(),
-            "cycle_off_ms": self.cycle_off_var.get(),
+            "mode": getattr(self, "_mode_val", "toggle"),
+            "duration_s": getattr(self, "_duration_str", "5.0"),
+            "cycle_on_ms": getattr(self, "_cycle_on_str", "3000"),
+            "cycle_off_ms": getattr(self, "_cycle_off_str", "2000"),
         }
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -548,6 +712,7 @@ class App(ctk.CTk):
         )
         if not path:
             return
+        path = os.path.normpath(path)
         name = os.path.basename(path)
         self._app_map[path] = name
         self.selected_paths.add(path)
@@ -610,7 +775,22 @@ class App(ctk.CTk):
         self.capturing = True
         self.hotkey_btn.configure(text="Press any key or mouse button...")
 
+        # Suspend active hotkey while capturing so pressing the old key
+        # doesn't trigger a cut mid-capture.
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        try:
+            mouse.unhook_all()
+        except Exception:
+            pass
+        with self._press_lock:
+            self._hk_vks = ()
+            self._key_held = False
+
         hooks = {}
+        done_lock = threading.Lock()
 
         def cleanup():
             try:
@@ -622,32 +802,79 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
-        def finish():
-            self.capturing = False
+        def finish(new_hotkey):
+            with done_lock:
+                if not self.capturing:
+                    return
+                self.capturing = False
+            self.hotkey = new_hotkey
             cleanup()
-            self.after(0, self._update_hotkey_label)
-            self.after(0, lambda: self.hotkey_btn.configure(text="Change Hotkey"))
-            self._register_hotkey()
+            self._register_hotkey(from_capture=True)
             self._save_config()
+            self._ui_queue.put(self._update_hotkey_label)
+            self._ui_queue.put(lambda: self.hotkey_btn.configure(text="Change Hotkey"))
 
         def on_key(event):
             if not self.capturing:
                 return
-            self.hotkey = {"type": "keyboard", "value": event.name}
-            finish()
+            sc = getattr(event, "scan_code", 0) or 0
+            vk = -sc if sc < 0 else (ctypes.windll.user32.MapVirtualKeyW(sc & 0xFF, 1) if sc > 0 else 0)
+            name = getattr(event, "name", None)
+            if not name or name == "unknown":
+                if vk:
+                    name = _vk_to_key_name(vk)
+                else:
+                    return
+            hk = {"type": "keyboard", "value": name}
+            if vk:
+                hk["vk"] = int(vk)
+            if sc > 0:
+                hk["scan_code"] = int(sc)
+            finish(hk)
 
         def on_mouse(event):
             if not self.capturing:
                 return
             if isinstance(event, mouse.ButtonEvent) and event.event_type == mouse.DOWN:
-                self.hotkey = {"type": "mouse", "value": event.button}
-                finish()
+                if event.button == mouse.LEFT or event.button not in MOUSE_NAMES:
+                    return
+                finish({"type": "mouse", "value": event.button})
 
-        hooks["kb"] = keyboard.on_press(on_key)
-        hooks["mo"] = mouse.hook(on_mouse)
+        def poll_capture():
+            user32 = ctypes.windll.user32
+            all_vks = tuple(VK_TO_MOUSE.keys()) + _CAPTURE_KB_VKS
+            initially_down = {vk for vk in all_vks if user32.GetAsyncKeyState(vk) & 0x8000}
+            while self.capturing and not self._stop_poller:
+                for vk in list(initially_down):
+                    if not (user32.GetAsyncKeyState(vk) & 0x8000):
+                        initially_down.discard(vk)
+                for vk in all_vks:
+                    if vk in initially_down:
+                        continue
+                    if user32.GetAsyncKeyState(vk) & 0x8000:
+                        if vk in VK_TO_MOUSE:
+                            finish({"type": "mouse", "value": VK_TO_MOUSE[vk]})
+                        else:
+                            sc = user32.MapVirtualKeyW(vk, 0)
+                            hk = {"type": "keyboard", "value": _vk_to_key_name(vk), "vk": int(vk)}
+                            if sc > 0:
+                                hk["scan_code"] = int(sc)
+                            finish(hk)
+                        return
+                time.sleep(0.01)
+
+        try:
+            hooks["kb"] = keyboard.on_press(on_key)
+        except Exception:
+            pass
+        try:
+            hooks["mo"] = mouse.hook(on_mouse)
+        except Exception:
+            pass
+        threading.Thread(target=poll_capture, daemon=True).start()
 
     # ---------------- Hotkey binding ----------------
-    def _register_hotkey(self):
+    def _register_hotkey(self, from_capture=False):
         try:
             keyboard.unhook_all()
         except Exception:
@@ -656,30 +883,113 @@ class App(ctk.CTk):
             mouse.unhook_all()
         except Exception:
             pass
-        self._key_held = False
+
+        if self.hotkey.get("type") == "mouse" and self.hotkey.get("value") not in MOUSE_NAMES:
+            self.hotkey = {"type": "keyboard", "value": "f8"}
 
         htype = self.hotkey["type"]
         val = self.hotkey["value"]
 
         if htype == "keyboard":
-            keyboard.on_press_key(val, self._on_press)
-            keyboard.on_release_key(val, self._on_release)
-        else:  # mouse
-            mouse.on_button(self._on_press, buttons=(val,), types=(mouse.DOWN,))
-            mouse.on_button(self._on_release, buttons=(val,), types=(mouse.UP,))
+            norm, vks, scans = _resolve_keyboard_hotkey(self.hotkey)
+        else:
+            norm = val
+            vk = MOUSE_VKS.get(val)
+            vks = (vk,) if vk else ()
+            scans = frozenset()
+
+        user32 = ctypes.windll.user32
+        currently_down = any(user32.GetAsyncKeyState(v) & 0x8000 for v in vks)
+
+        with self._press_lock:
+            self._key_held = False
+            self._hk_name = norm
+            self._hk_vks = vks
+            self._hk_scan_codes = scans
+            self._bind_gen = getattr(self, "_bind_gen", 0) + 1
+            self._ignore_until_release = bool(currently_down)
+
+        if htype == "keyboard":
+            try:
+                keyboard.hook(self._on_key_event)
+            except Exception:
+                pass
+        else:  # mouse (right, middle, x, x2 - never left)
+            try:
+                mouse.on_button(self._on_press, buttons=(val,), types=(mouse.DOWN,))
+                mouse.on_button(self._on_release, buttons=(val,), types=(mouse.UP,))
+            except Exception:
+                pass
+
+    def _matches_keyboard_hotkey(self, event) -> bool:
+        sc = getattr(event, "scan_code", 0) or 0
+        if sc > 0 and sc in self._hk_scan_codes:
+            return True
+        if sc < 0 and (-sc) in self._hk_vks:
+            return True
+        name = getattr(event, "name", None)
+        if name:
+            low = "i" if name == "İ" else name.lower()
+            if low == self._hk_name:
+                return True
+        return False
+
+    def _on_key_event(self, event):
+        if self.capturing or not self._matches_keyboard_hotkey(event):
+            return
+        if event.event_type == keyboard.KEY_DOWN:
+            self._on_press()
+        elif event.event_type == keyboard.KEY_UP:
+            self._on_release()
+
+    def _poll_hotkey_loop(self):
+        """Fallback GetAsyncKeyState poller so hotkeys and macros keep
+        working even if Windows drops the low-level hook or a game
+        swallows WH_KEYBOARD_LL events."""
+        user32 = ctypes.windll.user32
+        was_down = False
+        last_gen = -1
+        while not self._stop_poller:
+            try:
+                if self.capturing:
+                    was_down = False
+                    time.sleep(0.015)
+                    continue
+                gen = getattr(self, "_bind_gen", 0)
+                vks = self._hk_vks
+                is_down = bool(vks) and any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in vks)
+                if gen != last_gen:
+                    last_gen = gen
+                    was_down = is_down
+                    if not is_down and self._ignore_until_release:
+                        with self._press_lock:
+                            self._ignore_until_release = False
+                elif vks:
+                    if is_down and not was_down:
+                        was_down = True
+                        self._on_press()
+                    elif not is_down and was_down:
+                        was_down = False
+                        self._on_release()
+                    elif not is_down and self._ignore_until_release:
+                        with self._press_lock:
+                            self._ignore_until_release = False
+            except Exception:
+                pass
+            time.sleep(0.01)
 
     def _on_press(self, *_args):
-        if self._key_held:
-            return
+        with self._press_lock:
+            if self._ignore_until_release or self._key_held:
+                return
 
-        now = time.monotonic()
-        if now - self._last_press_time < MIN_PRESS_INTERVAL:
-            return
-        self._last_press_time = now
+            now = time.monotonic()
+            if now - self._last_press_time < MIN_PRESS_INTERVAL:
+                return
+            self._last_press_time = now
+            self._key_held = True
 
-        self._key_held = True
-
-        mode = self.mode.get()
+        mode = self._mode_val
         if mode == "hold":
             self._cut()
         elif mode == "toggle":
@@ -690,8 +1000,14 @@ class App(ctk.CTk):
             self._toggle_cycle()
 
     def _on_release(self, *_args):
-        self._key_held = False
-        if self.mode.get() == "hold":
+        with self._press_lock:
+            if self._ignore_until_release:
+                self._ignore_until_release = False
+                return
+            if not self._key_held:
+                return
+            self._key_held = False
+        if self._mode_val == "hold":
             self._restore()
 
     # ---------------- Network actions ----------------
@@ -699,18 +1015,27 @@ class App(ctk.CTk):
         if self.is_cut:
             return
         if not self.selected_paths:
-            self.after(0, self._warn_no_app)
+            self._ui_queue.put(self._warn_no_app)
             return
         self.is_cut = True
-        net.cut_apps(list(self.selected_paths))
-        self.after(0, lambda: self._set_status(False))
+        try:
+            net.cut_apps(list(self.selected_paths))
+        except Exception as exc:
+            self.is_cut = False
+            msg = str(exc)
+            self._ui_queue.put(lambda m=msg: messagebox.showerror("Firewall Error", m))
+            return
+        self._ui_queue.put(lambda: self._set_status(False))
 
     def _restore(self):
         if not self.is_cut:
             return
         self.is_cut = False
-        net.restore_apps()
-        self.after(0, lambda: self._set_status(True))
+        try:
+            net.restore_apps()
+        except Exception:
+            pass
+        self._ui_queue.put(lambda: self._set_status(True))
 
     def _warn_no_app(self):
         messagebox.showwarning(
@@ -725,10 +1050,10 @@ class App(ctk.CTk):
         if self.is_cut:
             return
         if not self.selected_paths:
-            self.after(0, self._warn_no_app)
+            self._ui_queue.put(self._warn_no_app)
             return
         try:
-            dur = max(0.1, float(self.duration_var.get().replace(",", ".")))
+            dur = max(0.1, float(self._duration_str.replace(",", ".")))
         except ValueError:
             dur = 5.0
         self._cut()
@@ -749,15 +1074,15 @@ class App(ctk.CTk):
         if self._cycle_running:
             return
         if not self.selected_paths:
-            self.after(0, self._warn_no_app)
+            self._ui_queue.put(self._warn_no_app)
             return
 
         try:
-            on_ms = max(1, int(float(self.cycle_on_var.get().replace(",", "."))))
+            on_ms = max(1, int(float(self._cycle_on_str.replace(",", "."))))
         except ValueError:
             on_ms = 3000
         try:
-            off_ms = max(1, int(float(self.cycle_off_var.get().replace(",", "."))))
+            off_ms = max(1, int(float(self._cycle_off_str.replace(",", "."))))
         except ValueError:
             off_ms = 2000
 
@@ -798,6 +1123,7 @@ class App(ctk.CTk):
         self.overlay.set_status(connected)
 
     def on_close(self):
+        self._stop_poller = True
         self._stop_cycle()
         self._save_config()
         net.force_clean()
